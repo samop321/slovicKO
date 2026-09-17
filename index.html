@@ -223,7 +223,10 @@ body{
 }
 .cal-day.empty{background:transparent;}
 .cal-day.today{outline:2px solid var(--green);}
-.cal-day.done{background:var(--green); color:var(--paper);}
+.cal-day.done{background:var(--green); color:var(--paper); cursor:pointer;}
+.cal-day.done:active{background:var(--green-light);}
+.calendar-hint{font-size:0.82rem; color:#8a8470; text-align:center; margin:0 0 14px;}
+.day-lesson-heading{font-family:var(--serif); color:var(--gold); font-size:0.9rem; margin:14px 0 4px; padding:0 4px;}
 .cal-day.done::after{
   content:"📖";
   position:absolute;
@@ -418,7 +421,19 @@ body{
       </div>
       <div class="streak-summary" id="streakSummary"></div>
       <div class="calendar-grid" id="calendarGrid"></div>
+      <p class="calendar-hint">Klikni na splnený deň (📖) a pozri si, ktoré slová si sa v ten deň učil.</p>
       <button class="btn-secondary" id="closeCalendarBtn">Späť</button>
+    </div>
+  </section>
+
+  <!-- DAY DETAIL -->
+  <section id="screen-day-detail" class="screen hidden">
+    <div class="history-card">
+      <div class="calendar-header">
+        <h2 id="dayDetailTitle">Deň</h2>
+      </div>
+      <div class="history-list" id="dayDetailList"></div>
+      <button class="btn-secondary" id="closeDayDetailBtn">Späť do kalendára</button>
     </div>
   </section>
 
@@ -445,8 +460,9 @@ body{
 "use strict";
 
 const LS_SEEN = "slovicko_seen_v1";
-const LS_SESSION = "slovicko_session_v2";
+const LS_SESSION = "slovicko_session_v3";
 const LS_DONE_DAYS = "slovicko_done_days_v1";
+const LS_DAY_LESSONS = "slovicko_day_lessons_v1";
 const WORDS_PER_DAY = 10;
 const ROUNDS_PER_DAY = 3;
 const TYPING_MAX_ATTEMPTS = 3;
@@ -504,6 +520,14 @@ function markDayDone(dateStr){
   }
 }
 
+function getDayLessons(){ return loadJSON(LS_DAY_LESSONS, {}); }
+function recordDayLesson(dateStr, words){
+  const all = getDayLessons();
+  if(!all[dateStr]) all[dateStr] = [];
+  all[dateStr].push(words);
+  saveJSON(LS_DAY_LESSONS, all);
+}
+
 function shuffled(arr){
   const a = arr.slice();
   for(let i=a.length-1;i>0;i--){
@@ -549,8 +573,9 @@ function makeFreshSession(words){
     round: 1,
     roundsDone: 0,
     phase: "matching", // matching -> typing-intro -> typing -> complete
-    typingOrder: null,
-    typingIndex: 0,
+    typingQueue: null,
+    typingTotal: 0,
+    typingSolved: 0,
     typingWrong: 0,
     completedOn: null
   };
@@ -567,7 +592,8 @@ const screens = {
   done: document.getElementById("screen-done"),
   finished: document.getElementById("screen-finished"),
   calendar: document.getElementById("screen-calendar"),
-  history: document.getElementById("screen-history")
+  history: document.getElementById("screen-history"),
+  dayDetail: document.getElementById("screen-day-detail")
 };
 function showScreen(name){
   Object.values(screens).forEach(s => s.classList.add("hidden"));
@@ -613,6 +639,8 @@ function renderIntro(){
 }
 
 document.getElementById("startRoundBtn").addEventListener("click", () => {
+  const ctx = getAudioCtx();
+  if(ctx && ctx.state !== "running") ctx.resume().catch(() => {});
   startRound();
 });
 
@@ -659,27 +687,37 @@ function getAudioCtx(){
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if(Ctx) audioCtx = new Ctx();
   }
-  if(audioCtx && audioCtx.state === "suspended") audioCtx.resume();
   return audioCtx;
 }
 function beep(freqs, duration, type, gainPeak){
   const ctx = getAudioCtx();
   if(!ctx) return;
-  const now = ctx.currentTime;
-  freqs.forEach((freq, i) => {
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = type;
-    osc.frequency.value = freq;
-    const start = now + i * (duration * 0.55);
-    gain.gain.setValueAtTime(0, start);
-    gain.gain.linearRampToValueAtTime(gainPeak, start + 0.01);
-    gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(start);
-    osc.stop(start + duration + 0.02);
-  });
+  const playNow = () => {
+    const now = ctx.currentTime;
+    freqs.forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = type;
+      osc.frequency.value = freq;
+      const start = now + i * (duration * 0.55);
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(gainPeak, start + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + duration + 0.02);
+    });
+  };
+  // On the very first sound the context is often still "suspended" until the
+  // browser's autoplay gesture check resolves; scheduling against a stale
+  // currentTime before resume() finishes causes that first beep to be silently
+  // dropped. Waiting for resume() to actually complete fixes that.
+  if(ctx.state !== "running"){
+    ctx.resume().then(playNow).catch(() => {});
+  }else{
+    playNow();
+  }
 }
 function playCorrectSound(){
   beep([740, 988], 0.14, "sine", 0.18);
@@ -815,13 +853,16 @@ function finishRound(){
 
 // ---------- typing round (final round: type the English word) ----------
 document.getElementById("startTypingBtn").addEventListener("click", () => {
+  const ctx = getAudioCtx();
+  if(ctx && ctx.state !== "running") ctx.resume().catch(() => {});
   startTypingPhase();
 });
 
 function startTypingPhase(){
   currentSession.phase = "typing";
-  currentSession.typingOrder = shuffled(currentSession.words);
-  currentSession.typingIndex = 0;
+  currentSession.typingQueue = shuffled(currentSession.words);
+  currentSession.typingTotal = currentSession.words.length;
+  currentSession.typingSolved = 0;
   currentSession.typingWrong = 0;
   saveSession(currentSession);
   renderTypingWord();
@@ -829,12 +870,11 @@ function startTypingPhase(){
 }
 
 function renderTypingWord(){
-  const order = currentSession.typingOrder;
-  const idx = currentSession.typingIndex;
-  const [, sk] = order[idx];
+  const [, sk] = currentSession.typingQueue[0];
   const left = TYPING_MAX_ATTEMPTS - currentSession.typingWrong;
 
-  document.getElementById("typingProgressLabel").textContent = `Slovo ${idx + 1} / ${order.length}`;
+  document.getElementById("typingProgressLabel").textContent =
+    `Vyriešené ${currentSession.typingSolved} / ${currentSession.typingTotal}`;
   document.getElementById("typingAttemptsLabel").textContent = `${left} ${attemptsWord(left)}`;
   document.getElementById("typingSkWord").textContent = sk;
 
@@ -849,9 +889,7 @@ function renderTypingWord(){
 }
 
 function checkTypingAnswer(){
-  const order = currentSession.typingOrder;
-  const idx = currentSession.typingIndex;
-  const [en] = order[idx];
+  const [en] = currentSession.typingQueue[0];
   const input = document.getElementById("typingInput");
   const feedback = document.getElementById("typingFeedback");
   const answer = input.value.trim().toLowerCase();
@@ -864,7 +902,7 @@ function checkTypingAnswer(){
     feedback.textContent = "Správne!";
     feedback.className = "typing-feedback ok";
     input.disabled = true;
-    setTimeout(advanceTyping, 550);
+    setTimeout(advanceAfterCorrect, 550);
   }else{
     currentSession.typingWrong++;
     playWrongSound();
@@ -873,7 +911,7 @@ function checkTypingAnswer(){
       feedback.className = "typing-feedback bad";
       input.disabled = true;
       saveSession(currentSession);
-      setTimeout(advanceTyping, 1600);
+      setTimeout(advanceAfterReveal, 4000);
     }else{
       const left = TYPING_MAX_ATTEMPTS - currentSession.typingWrong;
       feedback.textContent = `Skús znova (ešte ${left} ${attemptsWord(left)})`;
@@ -891,10 +929,12 @@ document.getElementById("typingInput").addEventListener("keydown", (e) => {
   if(e.key === "Enter") checkTypingAnswer();
 });
 
-function advanceTyping(){
-  currentSession.typingIndex++;
+// Answered correctly: this word is done for good, remove it from the queue.
+function advanceAfterCorrect(){
+  currentSession.typingQueue.shift();
+  currentSession.typingSolved++;
   currentSession.typingWrong = 0;
-  if(currentSession.typingIndex >= currentSession.typingOrder.length){
+  if(currentSession.typingQueue.length === 0){
     completeToday();
   }else{
     saveSession(currentSession);
@@ -902,11 +942,22 @@ function advanceTyping(){
   }
 }
 
+// Failed 3 times: word goes to the back of the queue and will come back
+// around later, however many times it takes, instead of being skipped for good.
+function advanceAfterReveal(){
+  const failedWord = currentSession.typingQueue.shift();
+  currentSession.typingQueue.push(failedWord);
+  currentSession.typingWrong = 0;
+  saveSession(currentSession);
+  renderTypingWord();
+}
+
 function completeToday(){
   currentSession.phase = "complete";
   currentSession.completedOn = todayStr();
   saveSession(currentSession);
   markDayDone(currentSession.completedOn);
+  recordDayLesson(currentSession.completedOn, currentSession.words);
   renderDoneScreen();
   showScreen("done");
 }
@@ -970,7 +1021,10 @@ function renderCalendar(){
     const dateStr = todayStr(new Date(y,m,day));
     const el = document.createElement("div");
     el.className = "cal-day";
-    if(doneDays.has(dateStr)) el.classList.add("done");
+    if(doneDays.has(dateStr)){
+      el.classList.add("done");
+      el.addEventListener("click", () => openDayDetail(dateStr));
+    }
     if(dateStr === todayS) el.classList.add("today");
     el.textContent = day;
     grid.appendChild(el);
@@ -979,6 +1033,51 @@ function renderCalendar(){
   document.getElementById("streakSummary").textContent =
     `📖 Aktuálna séria: ${computeStreak()} ${streakWord(computeStreak())} · Spolu splnených dní: ${doneDays.size}`;
 }
+
+const DOW_NAMES_FULL = ["nedeľa","pondelok","utorok","streda","štvrtok","piatok","sobota"];
+function formatDayTitle(dateStr){
+  const d = parseDateStr(dateStr);
+  return `${DOW_NAMES_FULL[d.getDay()]} ${d.getDate()}. ${d.getMonth()+1}. ${d.getFullYear()}`;
+}
+
+function openDayDetail(dateStr){
+  const lessons = getDayLessons()[dateStr] || [];
+  document.getElementById("dayDetailTitle").textContent = formatDayTitle(dateStr);
+
+  const list = document.getElementById("dayDetailList");
+  list.innerHTML = "";
+
+  if(lessons.length === 0){
+    const p = document.createElement("p");
+    p.textContent = "Pre tento deň nemám uložené žiadne slová.";
+    list.appendChild(p);
+  }
+
+  lessons.forEach((words, i) => {
+    const heading = document.createElement("p");
+    heading.className = "day-lesson-heading";
+    heading.textContent = lessons.length > 1 ? `Lekcia ${i + 1}` : "Lekcia";
+    list.appendChild(heading);
+
+    words.forEach(([en, sk]) => {
+      const row = document.createElement("div");
+      row.className = "history-row";
+      const s1 = document.createElement("span");
+      s1.textContent = en;
+      const s2 = document.createElement("span");
+      s2.textContent = sk;
+      row.appendChild(s1);
+      row.appendChild(s2);
+      list.appendChild(row);
+    });
+  });
+
+  showScreen("dayDetail");
+}
+
+document.getElementById("closeDayDetailBtn").addEventListener("click", () => {
+  showScreen("calendar");
+});
 function streakWord(n){
   if(n === 1) return "deň";
   if(n >= 2 && n <= 4) return "dni";
